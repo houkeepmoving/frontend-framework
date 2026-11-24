@@ -9,7 +9,8 @@
 ├── README.md
 ├── react/    # React 原理
 │   └── React底层原理详解.md
-└── vue/      # Vue 原理（计划中）
+└── vue/      # Vue 原理
+    └── Vue2与Vue3底层原理详解.md
 ```
 
 ## 内容索引
@@ -20,11 +21,11 @@
 |---|---|
 | [React底层原理详解](./react/React底层原理详解.md) | Fiber 架构起源与动机、FiberNode 数据结构、双缓冲（current / workInProgress）、Update 与 Lanes 优先级模型、Scheduler 调度与时间切片、Render 阶段（Reconciliation / Diff 算法）、Commit 阶段三段式（Mutation / Layout / Passive）、并发特性原理、Hooks 实现机制（链表结构、useState、useEffect）、Context 实现、常见设计问题 FAQ |
 
-### Vue（计划中）
+### Vue
 
-- 响应式系统（Object.defineProperty → Proxy）
-- 编译器与模板优化（静态提升、PatchFlag、Block Tree）
-- 组件更新与 Diff 算法（双端对比 / 最长递增子序列）
+| 文档 | 内容 |
+|---|---|
+| [Vue2与Vue3底层原理详解](./vue/Vue2与Vue3底层原理详解.md) | Vue2：defineProperty 响应式（Observer/Dep/Watcher）、依赖收集与派发更新、$set 与数组方法拦截、双端 Diff 算法、编译器三阶段、nextTick；Vue3：Proxy + effect 响应式、track/trigger 依赖结构、ref/computed 实现、编译优化（PatchFlag/静态提升/Block Tree）、快速 Diff 与最长递增子序列、渲染器 shapeFlags、Composition API 动机、Vue2 vs Vue3 对比总结；附 28 道常见面试题（按响应式/Diff/computed/nextTick/组件设计分类） |
 
 ## 维护说明
 
