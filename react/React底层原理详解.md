@@ -630,3 +630,277 @@ Layout 在 paint 前同步执行，改了 DOM 之后浏览器才绘制（只画�
 
 **Q：Fiber 树和「组件树 / DOM 树」是什么关系？**
 三棵树一一对应但不是同一个东西：JSX 描述的组件树（逻辑结构）→ Fiber 树（内部工作结构，带状态和调度信息）→ DOM 树（最终渲染结果）。Fiber 树上非 Host 的节点（函数组件等）在 DOM 里不存在对应节点。
+
+---
+
+# 第五部分：常见面试题
+
+## A. Fiber 与调度类
+
+### Q1：什么是 Fiber？React 为什么要重写为 Fiber 架构？
+
+**答**：Fiber 有两层含义：一是架构概念——一种「可中断、可恢复」的执行单元（可以理解为可保存进度的虚拟调用栈帧）；二是数据结构——`FiberNode`，React 内部一切工作的载体，每个组件/DOM 节点对应一个。
+
+重写的原因：React 15 的 Stack Reconciler 是**同步递归**的，依赖函数调用栈保存进度，一旦开始无法暂停。组件树大时一次更新可能占用主线程 50–100ms，导致输入响应延迟、动画掉帧，也无法实现「渲染中让位给更高优先级交互」。Fiber 把递归改成**链表遍历 + 手动循环**，进度记在 FiberNode 里，可随时暂停/恢复/丢弃，从而支撑时间切片和并发特性。React 16 (2017) 正式落地，重写酝酿了两年。
+
+### Q2：Render 阶段为什么可中断，Commit 阶段为什么不可中断？
+
+**答**：Render 阶段的工作是「构建 workInProgress 树」：执行组件函数、diff、打 flags——全程**不碰真实 DOM、不执行用户可见副作用**，所有进度存在 FiberNode 和变量里，所以被高优先级打断时可以整树丢弃、零成本重跑。Commit 阶段要做 DOM 增删改和生命周期执行，这个阶段如果中断，用户就会看到「改了一半的 DOM」，违反一致性，所以**同步、不可中断**。这也是「render 里禁止副作用」的根本原因：render 可能被多次执行甚至执行了但不提交。
+
+### Q3：React 的时间切片是怎么实现的？为什么不用 requestIdleCallback / setTimeout？
+
+**答**：Scheduler 用 **MessageChannel** 创建宏任务：任务按过期时间放进小顶堆，每个宏任务里执行工作循环，`shouldYield()` 判断已工作超过 **frameInterval（默认 5ms）** 就让出主线程，下次 MessageChannel 回调从保存的 `workInProgress` 指针继续。
+
+- 不用 `requestIdleCallback`：触发频率太低（空闲才有），且 `timeRemaining` 不可控，Safari 曾不支持
+- 不用 `setTimeout`：有 4ms 最小延迟，且嵌套超过 5 层会被 clamp 到 4ms 以上，切片太粗糙；MessageChannel 的 onmessage 在本次宏任务结束后立刻触发，延迟接近 0
+
+**饥饿避免**：每个任务有超时时间（按优先级 250ms~10s+），过期的任务强制同步全量执行，低优先级任务不会被高优先级无限插队。
+
+### Q4：React 的优先级模型是什么？说下 Lane 和 SchedulerPriority 的关系。
+
+**答**：React 内部是多套优先级配合：
+
+- **Lane**（React 17+）：31 位二进制位图，Reconciler 内部表示更新的优先级（SyncLane / InputContinuousLane / DefaultLane / TransitionLane / IdleLane…）。位图的好处是一个组件可同时持有多优先级更新，合并/判断/取最高都是 O(1) 位运算
+- **SchedulerPriority**：交给 Scheduler 排序用数值（ImmediatePriority -1 到 IdlePriority 5）
+- **事件优先级**：离散事件（click/keydown）创建 SyncLane 更新（表现为「同步更新」），连续输入（拖拽/hover）用 InputContinuousLane，`startTransition` 包裹的用 TransitionLane
+
+更新从 fiber 冒泡到根（fiber.lanes 和祖先 childLanes 打标），调度器看根的 lanes 就知道哪里有工作。
+
+### Q5：setState 之后到界面更新，中间发生了什么？
+
+**答**：以函数组件为例：
+
+1. `dispatchSetState` 创建带 lane 的 Update，挂到 hook.queue 的环形链表；先做一次 **eagerState 优化**（队列为空且新值与当前值 `Object.is` 相同则直接 return，不调度）
+2. `scheduleUpdateOnFiber`：沿 return 链冒泡标记 lanes，`ensureRootIsScheduled` 触发 Scheduler 调度
+3. Scheduler 按优先级安排 `performConcurrentWorkOnRoot`
+4. **Render 阶段**（可中断）：workLoop 循环执行 beginWork（bailout 判断 → 执行组件函数 → reconcileChildren diff）和 completeUnitOfWork（创建 DOM 实例、flags 冒泡到 subtreeFlags）
+5. **Commit 阶段**（同步）：Mutation（DOM 增删改）→ Layout（useLayoutEffect/componentDidMount，paint 前）→ 双缓冲切换 `root.current = finishedWork` → Passive（useEffect 通过 Scheduler 异步调度，paint 后）
+
+### Q6：React 18 里 setState 是同步还是异步？（automatic batching）
+
+**答**：React 18 之前就有批处理，但只在 React 事件处理函数和生命周期里生效（React 17 在 setTimeout/Promise 原生回调里 setState 是同步逐个渲染的，这是「有时同步有时异步」混乱的来源）。React 18 引入 **automatic batching**：无论在什么上下文（setTimeout、Promise、原生事件），多次 setState 默认合并为一次渲染。想要「改完立刻拿到新 DOM」用 `flushSync(fn)` 强制同步刷新。所以面试标准答法：**「同步/异步」的表述不准确，准确说法是「是否批处理」——批处理是优化，不是异步 API**。
+
+### Q7：并发模式（concurrent rendering）下 render 可能重复执行，这对写代码有什么要求？
+
+**答**：transition 渲染进行中若来了 sync 更新，React 会**丢弃当前 workInProgress 树、从根重新渲染**，而不是从断点继续。因此组件函数在同一个提交周期内可能被调用多次（执行了但没 commit）。要求：
+
+- render/组件函数必须是**纯函数**：不能在里面发请求、改外部变量、操作 DOM
+- 副作用只放 useEffect / 事件回调里
+- StrictMode 在开发环境故意双调用组件函数来提前暴露违反纯函数的代码
+
+## B. Hooks 原理类
+
+### Q8：Hooks 的实现原理是什么？
+
+**答**：函数组件没有实例，Hooks 状态存在 **FiberNode 上**。fiber 的 `memoizedState` 字段是 **hook 链表的头指针**，每个 Hook 节点含 `memoizedState`（当前值）、`queue`（更新队列，环形链表）、`next`。首次渲染（mount 阶段）按调用顺序逐个创建 hook 节点 append 到链表；更新渲染时按 `currentHook = currentHook.next` **顺序匹配**读取。React 内部用 `ReactCurrentDispatcher` 在 mount 和 update 之间切换两套 hooks 实现。setState 的 dispatch 闭包持有对应 fiber 和 hook 引用，所以每次渲染拿到的是同一个 setter。
+
+### Q9：为什么 Hooks 不能写在条件语句/循环里？
+
+**答**：因为 hook 是**按调用顺序**与链表节点一一匹配的。如果两次渲染调用顺序不同（条件分支里少调了一个 hook），链表位置对不上，状态会串到别的 hook 上。React 直接报错 `Rendered more hooks than during the previous render`。这不是风格约定而是机制约束——链表匹配没有「按名字查找」的能力（这也是早期讨论过的 alternative：按 key 索引，最终为了简单选择了顺序约定）。eslint-plugin-react-hooks 就是为静态检查这个约束。
+
+### Q10：setState 传入和当前相同的值，会重新渲染吗？
+
+**答**：分两层：
+
+1. **eagerState 优化**（dispatchSetState 内）：如果当前 fiber 没有其他待处理更新，React 会**立刻 eagerly 计算** `action(currentState)`，与当前值 `Object.is` 相同则直接 return，**连调度都不发生**
+2. 如果该 fiber 上还有其他更新（无法 eager 比较），会走完整调度，render 执行后 reducer 算出的 state 相同，**bailout 机制**可能让组件跳过重渲染——但注意 bailout 有条件：父组件本身在渲染中、或上下文变化时，子组件即使 state 没变仍可能重渲染（`eagerState` 只影响调度层）
+
+结论：「相同值不渲染」大体成立但**不是 100% 保证**，依赖不可变数据 + memo 才是可靠的。
+
+### Q11：useEffect 和 useLayoutEffect 的区别？执行时机分别是什么？
+
+**答**：
+
+- **useLayoutEffect**：在 Commit 的 **Layout 阶段**同步执行——DOM 已修改、浏览器**尚未绘制**。适合需要在绘制前测量/修改 DOM 的场景（如测量元素尺寸后定位 tooltip）。注意：里面「改了再读布局」会触发**强制同步 reflow**
+- **useEffect**：不在 commit 调用栈里，commit 结束后由 Scheduler 安排一个 **NormalPriority 的异步任务**（paint 之后、另一个宏任务里）执行。适合订阅、请求、日志等副作用
+
+区别的表现：useLayoutEffect 里改 DOM 用户看不到中间帧（不闪烁）；useEffect 改依赖视觉状态的 DOM 可能闪一帧。React 官方建议 90% 场景用 useEffect，SSR 时 useLayoutEffect 会有告警（服务端没有 paint 概念）。
+
+### Q12：useEffect 的 cleanup 什么时候执行？销毁组件和依赖变化的执行顺序？
+
+**答**：cleanup 与 effect 成对：commit 阶段 diff deps（`Object.is` 逐项浅比较），有变化时 **先 destroy（上一次的 cleanup）再 create（新的 effect）**；组件卸载时在 Mutation 阶段把 cleanup 入队执行。注意两点：cleanup 执行时机也是异步的（passive 队列），同一个 fiber 上多个 effect 按声明顺序成对执行；React 18 StrictMode 下开发环境 mount → cleanup → mount 会跑两遍以暴露副作用不幂等的问题。
+
+### Q13：useMemo / useCallback 的原理是什么？滥用的代价？
+
+**答**：`useMemo(fn, deps)` 在 hook 链表节点上缓存 `memoizedState`（计算结果）和 `deps`，更新渲染时浅比较 deps，相同则直接返回缓存值**不执行 fn**。`useCallback(fn, deps)` 就是 `useMemo(() => fn, deps)` 的别名，缓存的是函数引用。
+
+滥用代价：每个 useMemo/useCallback 本身有开销（比较 deps、维护链表节点），比直接计算更贵；并且**只优化本组件，不阻止子组件重渲染**——除非子组件是 memo 包裹的且 props 引用稳定才生效。正确用法：① 传给 memo 子组件的 props 引用稳定化；② 真正昂贵的计算；③ 作为其他 Hook 的依赖。无脑全包反而更慢。
+
+### Q14：useRef 的原理？和 createRef 的区别？
+
+**答**：`useRef(initialValue)` 首次渲染时创建一个 `{ current: initialValue }` 对象，挂在 hook 链表的 `memoizedState` 上；之后每次渲染**返回同一个对象引用**（updateRef 分支直接返回 currentHook.memoizedState）。所以改 `ref.current` 不会触发渲染（它不是响应式的），且跨渲染保持值——适合存 DOM 引用、定时器 id、最新值镜像（避免 useEffect 闭包陈旧值）。
+
+createRef 用于 class 组件（每次 render 都会创建新对象，不能用在函数组件，否则每次渲染都是新 ref）；useRef 在 fiber 上持久化。另外 `forwardRef` 是把父组件传入的 ref 转发到子组件内部节点/自定义暴露（配合 `useImperativeHandle` 控制暴露内容）。
+
+### Q15：自定义 Hook 和 mixin/HOC/render props 相比解决什么问题？
+
+**答**：逻辑复用的三代方案：
+
+- **mixin**（React 早期）：属性合并，来源不透明、命名冲突——已废弃
+- **HOC**：组件包装，props 命名冲突（嵌套地狱）、ref 透传麻烦、调试时组件层级爆炸
+- **render props**：显式传递但嵌套缩进深，只能复用「渲染」不能复用「逻辑+状态」
+
+**自定义 Hook**：复用的是**有状态的逻辑本身**（每次调用是独立的 hook 链表片段，状态天然隔离），无嵌套层级、无命名冲突（返回值可重命名）、类型推断友好。本质是「函数 + hooks 顺序约定」的组合，与 Composition API 的 composable 是同一设计思路的两种语言实现。
+
+## C. Diff 与渲染类
+
+### Q16：React 的 Diff 有哪三个前提假设？
+
+**答**：1）**不同类型的元素产生不同的树**：`<div>` 变 `<span>` 直接销毁整棵子树重建，不尝试复用；2）**同层级比较**：不跨层移动节点，跨层等于删了重建；3）**key 提示同身份**：同层级内用 key 判断是不是同一个元素。这三个假设把树 diff 从 O(n³) 降到 O(n)。
+
+**与 Vue 的实现差异**：React 的列表 diff 是**单向从左到右**遍历（靠 key 匹配 + lastPlacedIndex 判断移动），不移动匹配节点、只移动「顺序不对」的节点；Vue 2 是**双端 diff**（四指针头尾对比），Vue 3 是**预处理 + 最长递增子序列**。三者共同点都是同层比较 + key 复用，差异在移动策略的优化程度。
+
+### Q17：为什么列表要用稳定的 key？index 做 key 什么时候会出事？
+
+**答**：key 决定「复用还是重建」。用 index 的问题：插入/删除/排序后，同位置的 index 相同但**元素身份变了**，diff 认为「key 0 还是 key 0」，就地复用错误的 fiber——内部 state 串位（input 输入值错乱）、动画丢失、组件生命周期不触发。出事条件：**列表会插入/删除/重排，且子项有内部状态**。安全的场景：列表纯静态展示、只在尾部追加且不删除。此外 key 要「稳定且兄弟间唯一」，不要用 `Math.random()`（每次渲染都变，等于全部重建）。
+
+### Q18：React 怎么决定一个组件要不要重渲染？bailout 机制是什么？
+
+**答**：beginWork 时判断：
+
+1. 当前 fiber 的 `lanes` 里有没有本次 render 的优先级更新（`fiber.lanes & renderLanes`）
+2. props 是否浅比较相同（fiber.pendingProps vs memoizedProps，memo 组件就是在这里加 `shallowEqual` 的自定义比较）
+3. context 有没有变化（dependencies 里记录的 context 版本）
+
+三者都「没变化」→ **bailout**：直接克隆 current 节点，`alternate` 复用，整个子树跳过。`React.memo`、`shouldComponentUpdate`、`PureComponent` 都作用于第 2 步；`useMemo/useCallback` 通过稳定 props 引用为第 2 步创造条件。注意 context 变化会**穿透 memo**，强制订阅者重渲染。
+
+### Q19：父组件重渲染时，子组件默认会发生什么？怎么阻止？
+
+**答**：默认**子组件整个重渲染**（哪怕 props 没变）：父 render 产生新的子 React 元素（新对象引用），React 对非 memo 组件不比较 props 直接重新执行子组件函数。阻止手段按优先级：
+
+1. **React.memo** 包子组件（props 浅比较；复杂结构配合自定义比较函数）
+2. 稳定 props 引用：函数 props 用 `useCallback`，对象 props 用 `useMemo`，否则 memo 形同虚设
+3. **状态下沉**：把频繁变化的状态拆到更小的子组件里，缩小重渲染范围（结构性优化，比 memo 更根本）
+4. `useMemo` 包 JSX（Children memoization）
+5. 内容提升：把 children 作为 props 传入（JSX 在父组件创建，但如果父不重渲染它就不变）
+
+## D. 性能与工程类
+
+### Q20：React 渲染性能优化的完整手段清单？
+
+**答**：
+
+- **减少重渲染范围**：memo + useCallback/useMemo、状态下沉、children 透传、context 拆分（把频繁变化的 context 拆出去，避免大范围订阅者重渲染）
+- **减少渲染成本**：虚拟列表（react-window/virtuoso）处理长列表、避免在 render 里做昂贵计算（useMemo）、懒加载（React.lazy + Suspense 代码分割）
+- **优化更新调度**：非紧急更新用 `startTransition`/`useDeferredValue`（如搜索输入时列表过滤），让输入保持响应
+- **避免副作用层的问题**：useEffect 依赖写对（避免无限循环）、数据请求竞态处理（AbortController / cleanup 标志位）
+- **不可变更新**：正确触发浅比较（useState 里直接改引用内容会让 memo 失效）
+
+### Q21：不可变数据（immutable update）为什么是 React 的核心约定？
+
+**答**：因为 React 的相等性判断全是**引用比较**（`Object.is`）：state 相等性、memo 的 props 浅比较、useMemo/useEffect 的 deps 比较。如果直接修改对象内部属性（`obj.x = 1`），引用不变，React 认为「没变」，跳过更新——这是最经典的「改了但界面不更新」bug 的根源。所以更新嵌套状态要用展开运算符/结构化复制创建新引用（`{...obj, x: 1}`、`arr.concat()`），大型状态树可引入 immer（Proxy 写时复制）或 Immutable.js。
+
+### Q22：startTransition / useDeferredValue 是什么？解决什么问题？
+
+**答**：都用于**优先级分层**：把「可以让界面等一下」的更新标为 TransitionLane（低优先级），让输入等紧急更新插队。
+
+- `startTransition(() => setList(filtered))`：包裹更新本身。搜索框场景：输入（SyncLane）立即响应，过滤重列表（TransitionLane）可中断、可被丢弃重跑，不阻塞打字
+- `useDeferredValue(value)`：包值，返回延迟版本——本质是「用旧值渲染一帧 + 调度用新值的渲染」，适合把「上一次的值先展示着」的场景
+
+区别：startTransition 控制的是「哪段代码触发的更新」，useDeferredValue 控制的是「某个值的变化被延后感知」，后者无需改 setState 调用处，适合封装在子组件内部。
+
+### Q23：Suspense 的工作原理？
+
+**答**：子组件在 render 中 **throw 一个 promise**（legacy 数据获取方式）→ React 在 render 阶段捕获，把该子树标记为 Suspended → commit 时**整棵 workInProgress 树不替换 current 树**（DOM 保持旧状态），只显示最近的 Suspense 边界的 fallback。promise resolve 后重新调度渲染，成功才切换到新内容。这完全依赖双缓冲——「未来」和「现在」两棵树天然分离。React 18 之后配合 `React.lazy`（代码分包）、RSC（Server Component）数据流使用；`use()` + 框架级缓存是新的推荐用法。
+
+## E. 手写与综合类
+
+### Q24：手写一个简化版 useState。
+
+```js
+// 单 fiber 简化版：演示 hook 链表 + 状态持久化 + 触发重渲染
+let hooks = [];
+let hookIndex = 0;
+let isMount = true;
+
+function useState(initialValue) {
+  const currentHookIndex = hookIndex;
+  hooks[currentHookIndex] = hooks[currentHookIndex] ?? initialValue;
+
+  function setState(newState) {
+    hooks[currentHookIndex] =
+      typeof newState === 'function' ? newState(hooks[currentHookIndex]) : newState;
+    scheduleRender();  // 触发重渲染（真实 React 里是调度，这里是简化）
+  }
+
+  hookIndex++;
+  return [hooks[currentHookIndex], setState];
+}
+
+function render() {
+  hookIndex = 0;   // ★ 每次渲染重置游标，hooks 按调用顺序重新匹配
+  isMount = false;
+  App();           // 执行组件函数
+}
+```
+
+要点：① 状态存在**外部闭包的链表**里（对应 fiber.memoizedState），组件函数本身无状态；② 每次 render 重置 `hookIndex`，按调用顺序匹配——这就是「不能写条件分支」的原因；③ 函数式更新 `setState(prev => ...)` 支持批量。
+
+### Q25：手写防抖 / 节流 Hook。
+
+```js
+function useDebouncedValue(value, delay = 300) {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(timer);   // ★ cleanup 清掉上一次的 timer，实现防抖
+  }, [value, delay]);
+  return debounced;
+}
+
+function useThrottledValue(value, interval = 300) {
+  const [throttled, setThrottled] = useState(value);
+  const lastExecuted = useRef(0);
+  useEffect(() => {
+    const now = Date.now();
+    const remaining = interval - (now - lastExecuted.current);
+    const timer = setTimeout(
+      () => { lastExecuted.current = Date.now(); setThrottled(value); },
+      Math.max(remaining, 0)
+    );
+    return () => clearTimeout(timer);
+  }, [value, interval]);
+  return throttled;
+}
+```
+
+要点：防抖/节流的「重置」全部靠 **useEffect cleanup** 实现，不需要手动管理 timer 生命周期。
+
+### Q26：React 和 Vue 的响应式/更新模型有什么本质区别？
+
+**答**：
+
+| 维度 | React | Vue |
+|---|---|---|
+| 更新触发 | **推模式（渲染时机）**：setState 标记「组件需要重渲染」，从该组件**向下**重新执行整个子树 | **推模式（数据驱动）**：数据 setter/effect 精确知道谁依赖它，**只通知订阅者** |
+| 粒度 | 组件级：默认子树全量重渲染，靠 memo/reducer bailout 缩小 | Vue2 组件级（渲染 Watcher），Vue3 编译优化后接近节点/属性级 |
+| 依赖收集 | 无（运行时不知道 render 读了什么，只能全量重跑再 diff） | 运行时收集（getter 触发 track），依赖关系精确 |
+| 不可变要求 | 强（引用比较判定变化） | 弱（Proxy setter 直接感知属性修改，`obj.x = 1` 就能触发） |
+| 优化位置 | 运行时（memo、useMemo、虚拟 DOM diff） | 编译时（PatchFlag、Block Tree、静态提升） |
+
+一句话总结：**React 的思路是「重新执行 + diff 兜底」，Vue 的思路是「精确追踪 + 最小更新」**——这决定了两边性能优化手段完全不同（React 优化「少执行」，Vue 优化「少 diff」）。
+
+### Q27：React 18 的新特性有哪些？分别基于什么原理？
+
+**答**：
+
+- **automatic batching**：调度层改动，所有上下文的 setState 默认合并批处理
+- **并发渲染 + startTransition/useDeferredValue**：基于 Fiber 可中断渲染 + Lane 优先级（TransitionLane）
+- **Suspense 增强（流式 SSR）**：`renderToPipeableStream` 服务端流式注入 HTML + selective hydration（按优先级分批水合）
+- **useId**：SSR/流式场景下生成稳定的唯一 id（同一次渲染内一致，避免水合不匹配）
+- **useSyncExternalStore**：为外部 store（Redux/Zustand）提供「并发安全的订阅」——并发渲染下 store 快照可能撕裂（tearing），这个 API 保证读到的快照与当前渲染一致
+- **新 Hooks（useDeferredValue、useInsertionEffect）**：分别对应优先级分层和 CSS-in-JS 注入时机
+
+### Q28：为什么 React 需要 useSyncExternalStore？什么是 tearing（撕裂）？
+
+**答**：并发渲染中，一次渲染可能被打断、恢复甚至重跑。如果外部 store（不在 React 状态体系内）在渲染中途被修改，被中断前后的渲染可能读到**同一个 store 的不同快照**，导致 UI 不同部分显示不一致——这就是 tearing。`useSyncExternalStore(subscribe, getSnapshot)` 的解决方式：渲染开始时锁定快照，如果渲染期间快照变了就**丢弃重渲染**，保证一次提交内的所有读取一致。这也是 Redux 等外部状态库适配 React 18 并发模式的必经改造。
+
+---
+
+## 附：面试答题技巧提示
+
+- Fiber 题按「**为什么重写 → 数据结构 → 两棵树 → 两阶段 → 调度**」五步走，全程围绕「可中断」展开
+- Hooks 题的钥匙是「**hook 链表 + 顺序匹配**」，几乎所有 Hooks 约束（不能条件调用、依赖数组、闭包陈旧值）都能从这一点推出来
+- 性能优化题先说「重渲染是怎么发生的」（父 render 产生新元素引用），再说优化手段，显得有因果链而不是背清单
+- 对比题（React vs Vue）落到「**重新执行+diff 兜底 vs 精确追踪+最小更新**」这个本质分歧，比罗列 API 差异高一档
+- 手写题里主动说出「对应 React 内部的哪个机制」（如 hookIndex 对应链表游标、cleanup 对应 passive effect destroy），是加分点

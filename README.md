@@ -19,7 +19,7 @@
 
 | 文档 | 内容 |
 |---|---|
-| [React底层原理详解](./react/React底层原理详解.md) | Fiber 架构起源与动机、FiberNode 数据结构、双缓冲（current / workInProgress）、Update 与 Lanes 优先级模型、Scheduler 调度与时间切片、Render 阶段（Reconciliation / Diff 算法）、Commit 阶段三段式（Mutation / Layout / Passive）、并发特性原理、Hooks 实现机制（链表结构、useState、useEffect）、Context 实现、常见设计问题 FAQ |
+| [React底层原理详解](./react/React底层原理详解.md) | Fiber 架构起源与动机、FiberNode 数据结构、双缓冲（current / workInProgress）、Update 与 Lanes 优先级模型、Scheduler 调度与时间切片、Render 阶段（Reconciliation / Diff 算法）、Commit 阶段三段式（Mutation / Layout / Passive）、并发特性原理、Hooks 实现机制（链表结构、useState、useEffect）、Context 实现、常见设计问题 FAQ；附 28 道常见面试题（按 Fiber 调度 / Hooks / Diff 渲染 / 性能工程 / 手写题分类） |
 
 ### Vue
 
